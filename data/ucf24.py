@@ -68,11 +68,15 @@ def readsplitfile(splitfile):
 
 def make_lists(rootpath, imgtype, split=1, fulltest=False):
     imagesDir = rootpath + imgtype + '/'
+    # splitfile = rootpath + 'splitfiles/trainlist_new.txt'
+    # splitfile_val = rootpath + 'splitfiles/vallist_new.txt'
     splitfile = rootpath + 'splitfiles/trainlist{:02d}.txt'.format(split)
     trainvideos = readsplitfile(splitfile)
+    # valvideos = readsplitfile(splitfile_val)
     trainlist = []
     testlist = []
-
+    import collections
+    train_vid_frame = collections.defaultdict(list)
     with open(rootpath + 'splitfiles/pyannot.pkl','rb') as fff:
         database = pickle.load(fff)
 
@@ -82,6 +86,9 @@ def make_lists(rootpath, imgtype, split=1, fulltest=False):
     ratios = np.asarray([1.1,0.8,4.7,1.4,0.9,2.6,2.2,3.0,3.0,5.0,6.2,2.7,3.5,3.1,4.3,2.5,4.5,3.4,6.7,3.6,1.6,3.4,0.6,4.3])
     # ratios = np.ones_like(ratios) #TODO:uncomment this line and line 155, 156 to compute new ratios might be useful for JHMDB21
     video_list = []
+    vid_last = -100
+    train_cnt = 0
+    lock = True
     for vid, videoname in enumerate(sorted(database.keys())):
         video_list.append(videoname)
         actidx = database[videoname]['label']
@@ -89,9 +96,17 @@ def make_lists(rootpath, imgtype, split=1, fulltest=False):
         step = ratios[actidx]
         numf = database[videoname]['numf']
         lastf = numf-1
+        # if videoname in trainvideos:
+        #     istrain = True
+        # elif videoname in valvideos:
+        #     istrain = False
+        #     step = ratios[actidx]*2.0
+        # else:
+        #     continue
+
         if videoname not in trainvideos:
             istrain = False
-            step = ratios[actidx]*2.0
+            step = ratios[actidx] * 2.0
         if fulltest:
             step = 1
             lastf = numf
@@ -134,12 +149,26 @@ def make_lists(rootpath, imgtype, split=1, fulltest=False):
 
                 if istrain: # if it is training video
                     trainlist.append([vid, frame_num+1, np.asarray(labels)-1, np.asarray(all_boxes)])
+                    if vid is not vid_last and lock is False:  # and vid_last > 0
+                        lock = True
+                        if vid_last > 0:
+                            train_vid_frame[str(vid_last)].append(train_cnt)
+
+                    if vid is not vid_last and lock is True:
+                        train_vid_frame[str(vid)].append(train_cnt)
+                        lock = False
+
+                    train_cnt += 1
+                    vid_last = vid
+
                     train_action_counts[actidx] += len(labels)
                 else: # if test video and has micro-tubes with GT
                     testlist.append([vid, frame_num+1, np.asarray(labels)-1, np.asarray(all_boxes)])
                     test_action_counts[actidx] += len(labels)
             elif fulltest and not istrain: # if test video with no ground truth and fulltest is trues
                 testlist.append([vid, frame_num+1, np.asarray([9999]), np.zeros((1,4))])
+
+    train_vid_frame[str(vid_last)].append(train_cnt)
 
     for actidx, act_count in enumerate(train_action_counts): # just to see the distribution of train and test sets
         print('train {:05d} test {:05d} action {:02d} {:s}'.format(act_count, test_action_counts[actidx] , int(actidx), CLASSES[actidx]))
@@ -149,7 +178,7 @@ def make_lists(rootpath, imgtype, split=1, fulltest=False):
     # print('older ratios', ratios)
     print('Trainlistlen', len(trainlist), ' testlist ', len(testlist))
 
-    return trainlist, testlist, video_list
+    return trainlist, testlist, video_list, train_vid_frame
 
 
 class UCF24Detection(data.Dataset):
@@ -171,9 +200,12 @@ class UCF24Detection(data.Dataset):
         self._annopath = os.path.join(root, 'labels/', '%s.txt')
         self._imgpath = os.path.join(root, input_type)
         self.ids = list()
+        self.last_vid = []
 
-        trainlist, testlist, video_list = make_lists(root, input_type, split=1, fulltest=full_test)
+        trainlist, testlist, video_list, train_vid_frame = make_lists(root, input_type, split=1, fulltest=full_test)
         self.video_list = video_list
+        self.train_vid_frame = train_vid_frame
+
         if self.image_set == 'train':
             self.ids = trainlist
         elif self.image_set == 'test':
@@ -182,7 +214,7 @@ class UCF24Detection(data.Dataset):
             print('spacify correct subset ')
 
     def __getitem__(self, index):
-        im, gt, img_index = self.pull_item(index)
+        im, gt, img_index= self.pull_item(index)
 
         return im, gt, img_index
 
@@ -195,6 +227,11 @@ class UCF24Detection(data.Dataset):
         video_id = annot_info[0]
         videoname = self.video_list[video_id]
         img_name = self._imgpath + '/{:s}/{:05d}.jpg'.format(videoname, frame_num)
+        vid = img_name.split('/')[-2]
+        change_vid = False
+        if vid != self.last_vid:
+            change_vid = True
+        self.last_vid = vid
         # print(img_name)
         img = cv2.imread(img_name)
         height, width, channels = img.shape
@@ -209,7 +246,7 @@ class UCF24Detection(data.Dataset):
             # img = img.transpose(2, 0, 1)
             target = np.hstack((boxes, np.expand_dims(labels, axis=1)))
         # print(height, width,target)
-        return torch.from_numpy(img).permute(2, 0, 1), target, index
+        return torch.from_numpy(img).permute(2, 0, 1), target, [index, change_vid]
         # return torch.from_numpy(img), target, height, width
 
 
